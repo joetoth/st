@@ -68,6 +68,7 @@ char *argv0;
 #define LEN(a)			(sizeof(a) / sizeof(a)[0])
 #define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
 #define BETWEEN(x, a, b)	((a) <= (x) && (x) <= (b))
+#define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
 #define ISCONTROLC0(c)		(BETWEEN(c, 0, 0x1f) || (c) == '\177')
 #define ISCONTROLC1(c)		(BETWEEN(c, 0x80, 0x9f))
 #define ISCONTROL(c)		(ISCONTROLC0(c) || ISCONTROLC1(c))
@@ -275,7 +276,7 @@ typedef struct {
 	uint b;
 	uint mask;
 	char *s;
-} Mousekey;
+} MouseShortcut;
 
 typedef struct {
 	KeySym k;
@@ -415,7 +416,7 @@ static int32_t tdefcolor(int *, int *, int);
 static void tdeftran(char);
 static inline int match(uint, uint);
 static void ttynew(void);
-static void ttyread(void);
+static size_t ttyread(void);
 static void ttyresize(void);
 static void ttysend(char *, size_t);
 static void ttywrite(const char *, size_t);
@@ -439,7 +440,6 @@ static void xresettitle(void);
 static void xsetpointermotion(int);
 static void xseturgency(int);
 static void xsetsel(char *, Time);
-static void xtermclear(int, int, int, int);
 static void xunloadfont(Font *);
 static void xunloadfonts(void);
 static void xresize(int, int);
@@ -523,14 +523,15 @@ static int cmdfd;
 static pid_t pid;
 static Selection sel;
 static int iofd = 1;
-static char **opt_cmd = NULL;
-static char *opt_io = NULL;
-static char *opt_title = NULL;
-static char *opt_embed = NULL;
+static char **opt_cmd  = NULL;
 static char *opt_class = NULL;
-static char *opt_font = NULL;
-static char *opt_line = NULL;
-static int oldbutton = 3; /* button event on startup: 3 = release */
+static char *opt_embed = NULL;
+static char *opt_font  = NULL;
+static char *opt_io    = NULL;
+static char *opt_line  = NULL;
+static char *opt_name  = NULL;
+static char *opt_title = NULL;
+static int oldbutton   = 3; /* button event on startup: 3 = release */
 
 static char *usedfont = NULL;
 static double usedfontsize = 0;
@@ -695,9 +696,10 @@ utf8validate(Rune *u, size_t i)
 void
 selinit(void)
 {
-	memset(&sel.tclick1, 0, sizeof(sel.tclick1));
-	memset(&sel.tclick2, 0, sizeof(sel.tclick2));
+	clock_gettime(CLOCK_MONOTONIC, &sel.tclick1);
+	clock_gettime(CLOCK_MONOTONIC, &sel.tclick2);
 	sel.mode = SEL_IDLE;
+	sel.snap = 0;
 	sel.ob.x = -1;
 	sel.primary = NULL;
 	sel.clipboard = NULL;
@@ -943,17 +945,17 @@ void
 bpress(XEvent *e)
 {
 	struct timespec now;
-	Mousekey *mk;
+	MouseShortcut *ms;
 
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forceselmod)) {
 		mousereport(e);
 		return;
 	}
 
-	for (mk = mshortcuts; mk < mshortcuts + LEN(mshortcuts); mk++) {
-		if (e->xbutton.button == mk->b
-				&& match(mk->mask, e->xbutton.state)) {
-			ttysend(mk->s, strlen(mk->s));
+	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
+		if (e->xbutton.button == ms->b
+				&& match(ms->mask, e->xbutton.state)) {
+			ttysend(ms->s, strlen(ms->s));
 			return;
 		}
 	}
@@ -1463,7 +1465,7 @@ ttynew(void)
 	}
 }
 
-void
+size_t
 ttyread(void)
 {
 	static char buf[BUFSIZ];
@@ -1488,14 +1490,16 @@ ttyread(void)
 
 	/* keep any uncomplete utf8 char for the next call */
 	memmove(buf, ptr, buflen);
+
+	return ret;
 }
 
 void
 ttywrite(const char *s, size_t n)
 {
-	fd_set wfd;
-	struct timespec tv;
+	fd_set wfd, rfd;
 	ssize_t r;
+	size_t lim = 256;
 
 	/*
 	 * Remember that we are using a pty, which might be a modem line.
@@ -1505,38 +1509,32 @@ ttywrite(const char *s, size_t n)
 	 */
 	while (n > 0) {
 		FD_ZERO(&wfd);
+		FD_ZERO(&rfd);
 		FD_SET(cmdfd, &wfd);
-		tv.tv_sec = 0;
-		tv.tv_nsec = 0;
+		FD_SET(cmdfd, &rfd);
 
 		/* Check if we can write. */
-		if (pselect(cmdfd+1, NULL, &wfd, NULL, &tv, NULL) < 0) {
+		if (pselect(cmdfd+1, &rfd, &wfd, NULL, NULL, NULL) < 0) {
 			if (errno == EINTR)
 				continue;
 			die("select failed: %s\n", strerror(errno));
 		}
-		if(!FD_ISSET(cmdfd, &wfd)) {
-			/* No, then free some buffer space. */
-			ttyread();
-		} else {
+		if (FD_ISSET(cmdfd, &wfd)) {
 			/*
-			 * Only write 256 bytes at maximum. This seems to be a
-			 * reasonable value for a serial line. Bigger values
-			 * might clog the I/O.
+			 * Only write the bytes written by ttywrite() or the
+			 * default of 256. This seems to be a reasonable value
+			 * for a serial line. Bigger values might clog the I/O.
 			 */
-			r = write(cmdfd, s, (n < 256)? n : 256);
-			if (r < 0) {
-				die("write error on tty: %s\n",
-						strerror(errno));
-			}
+			if ((r = write(cmdfd, s, (n < lim)? n : lim)) < 0)
+				goto write_error;
 			if (r < n) {
 				/*
 				 * We weren't able to write out everything.
 				 * This means the buffer is getting full
 				 * again. Empty it.
 				 */
-				if (n < 256)
-					ttyread();
+				if (n < lim)
+					lim = ttyread();
 				n -= r;
 				s += r;
 			} else {
@@ -1544,7 +1542,13 @@ ttywrite(const char *s, size_t n)
 				break;
 			}
 		}
+		if (FD_ISSET(cmdfd, &rfd))
+			lim = ttyread();
 	}
+	return;
+
+write_error:
+	die("write error on tty: %s\n", strerror(errno));
 }
 
 void
@@ -2433,15 +2437,15 @@ csihandle(void)
 		break;
 	case ' ':
 		switch (csiescseq.mode[1]) {
-			case 'q': /* DECSCUSR -- Set Cursor Style */
-				DEFAULT(csiescseq.arg[0], 1);
-				if (!BETWEEN(csiescseq.arg[0], 0, 6)) {
-					goto unknown;
-				}
-				xw.cursor = csiescseq.arg[0];
-				break;
-			default:
+		case 'q': /* DECSCUSR -- Set Cursor Style */
+			DEFAULT(csiescseq.arg[0], 1);
+			if (!BETWEEN(csiescseq.arg[0], 0, 6)) {
 				goto unknown;
+			}
+			xw.cursor = csiescseq.arg[0];
+			break;
+		default:
+			goto unknown;
 		}
 		break;
 	}
@@ -3209,17 +3213,6 @@ xsetcolorname(int x, const char *name)
 	return 0;
 }
 
-void
-xtermclear(int col1, int row1, int col2, int row2)
-{
-	XftDrawRect(xw.draw,
-			&dc.col[IS_SET(MODE_REVERSE) ? defaultfg : defaultbg],
-			borderpx + col1 * xw.cw,
-			borderpx + row1 * xw.ch,
-			(col2-col1+1) * xw.cw,
-			(row2-row1+1) * xw.ch);
-}
-
 /*
  * Absolute coordinates.
  */
@@ -3234,7 +3227,8 @@ xclear(int x1, int y1, int x2, int y2)
 void
 xhints(void)
 {
-	XClassHint class = {opt_class ? opt_class : termname, termname};
+	XClassHint class = {opt_name ? opt_name : termname,
+	                    opt_class ? opt_class : termname};
 	XWMHints wm = {.flags = InputHint, .input = 1};
 	XSizeHints *sizeh = NULL;
 
@@ -3284,6 +3278,7 @@ xloadfont(Font *f, FcPattern *pattern)
 {
 	FcPattern *match;
 	FcResult result;
+	XGlyphInfo extents;
 
 	match = FcFontMatch(NULL, pattern, &result);
 	if (!match)
@@ -3294,6 +3289,10 @@ xloadfont(Font *f, FcPattern *pattern)
 		return 1;
 	}
 
+	XftTextExtentsUtf8(xw.dpy, f->match,
+		(const FcChar8 *) ascii_printable,
+		strlen(ascii_printable), &extents);
+
 	f->set = NULL;
 	f->pattern = FcPatternDuplicate(pattern);
 
@@ -3303,7 +3302,7 @@ xloadfont(Font *f, FcPattern *pattern)
 	f->rbearing = f->match->max_advance_width;
 
 	f->height = f->ascent + f->descent;
-	f->width = f->lbearing + f->rbearing;
+	f->width = DIVCEIL(extents.xOff, strlen(ascii_printable));
 
 	return 0;
 }
@@ -3420,6 +3419,7 @@ xzoomabs(const Arg *arg)
 	xunloadfonts();
 	xloadfonts(usedfont, arg->f);
 	cresize(0, 0);
+	ttyresize();
 	redraw();
 	xhints();
 }
@@ -3466,7 +3466,7 @@ xinit(void)
 	if (xw.gm & XNegative)
 		xw.l += DisplayWidth(xw.dpy, xw.scr) - xw.w - 2;
 	if (xw.gm & YNegative)
-		xw.t += DisplayWidth(xw.dpy, xw.scr) - xw.h - 2;
+		xw.t += DisplayHeight(xw.dpy, xw.scr) - xw.h - 2;
 
 	/* Events */
 	xw.attrs.background_pixel = dc.col[defaultbg].pixel;
@@ -3671,7 +3671,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		specs[numspecs].font = frc[f].font;
 		specs[numspecs].glyph = glyphidx;
 		specs[numspecs].x = (short)xp;
-		specs[numspecs].y = (short)(winy + frc[f].font->ascent);
+		specs[numspecs].y = (short)yp;
 		xp += runewidth;
 		numspecs++;
 	}
@@ -3818,6 +3818,7 @@ xdrawglyph(Glyph g, int x, int y)
 {
 	int numspecs;
 	XftGlyphFontSpec spec;
+
 	numspecs = xmakeglyphfontspecs(&spec, &g, 1, x, y);
 	xdrawglyphfontspecs(&spec, g, numspecs, x, y);
 }
@@ -3827,7 +3828,9 @@ xdrawcursor(void)
 {
 	static int oldx = 0, oldy = 0;
 	int curx;
-	Glyph g = {' ', ATTR_NULL, defaultbg, defaultcs};
+	Glyph g = {' ', ATTR_NULL, defaultbg, defaultcs}, og;
+	int ena_sel = sel.ob.x != -1 && sel.alt == IS_SET(MODE_ALTSCREEN);
+	Color drawcol;
 
 	LIMIT(oldx, 0, term.col-1);
 	LIMIT(oldy, 0, term.row-1);
@@ -3840,10 +3843,36 @@ xdrawcursor(void)
 	if (term.line[term.c.y][curx].mode & ATTR_WDUMMY)
 		curx--;
 
+	/* remove the old cursor */
+	og = term.line[oldy][oldx];
+	if (ena_sel && selected(oldx, oldy))
+		og.mode ^= ATTR_REVERSE;
+	xdrawglyph(og, oldx, oldy);
+
 	g.u = term.line[term.c.y][term.c.x].u;
 
-	/* remove the old cursor */
-	xdrawglyph(term.line[oldy][oldx], oldx, oldy);
+	/*
+	 * Select the right color for the right mode.
+	 */
+	if (IS_SET(MODE_REVERSE)) {
+		g.mode |= ATTR_REVERSE;
+		g.bg = defaultfg;
+		if (ena_sel && selected(term.c.x, term.c.y)) {
+			drawcol = dc.col[defaultcs];
+			g.fg = defaultrcs;
+		} else {
+			drawcol = dc.col[defaultrcs];
+			g.fg = defaultcs;
+		}
+	} else {
+		if (ena_sel && selected(term.c.x, term.c.y)) {
+			drawcol = dc.col[defaultrcs];
+			g.fg = defaultfg;
+			g.bg = defaultrcs;
+		} else {
+			drawcol = dc.col[defaultcs];
+		}
+	}
 
 	if (IS_SET(MODE_HIDE))
 		return;
@@ -3851,47 +3880,44 @@ xdrawcursor(void)
 	/* draw the new one */
 	if (xw.state & WIN_FOCUSED) {
 		switch (xw.cursor) {
-			case 0: /* Blinking Block */
-			case 1: /* Blinking Block (Default) */
-			case 2: /* Steady Block */
-				if (IS_SET(MODE_REVERSE)) {
-						g.mode |= ATTR_REVERSE;
-						g.fg = defaultcs;
-						g.bg = defaultfg;
-					}
-
-				g.mode |= term.line[term.c.y][curx].mode & ATTR_WIDE;
-				xdrawglyph(g, term.c.x, term.c.y);
-				break;
-			case 3: /* Blinking Underline */
-			case 4: /* Steady Underline */
-				XftDrawRect(xw.draw, &dc.col[defaultcs],
-						borderpx + curx * xw.cw,
-						borderpx + (term.c.y + 1) * xw.ch - cursorthickness,
-						xw.cw, cursorthickness);
-				break;
-			case 5: /* Blinking bar */
-			case 6: /* Steady bar */
-				XftDrawRect(xw.draw, &dc.col[defaultcs],
-						borderpx + curx * xw.cw,
-						borderpx + term.c.y * xw.ch,
-						cursorthickness, xw.ch);
-				break;
+		case 7: /* st extension: snowman */
+			utf8decode("☃", &g.u, UTF_SIZ);
+		case 0: /* Blinking Block */
+		case 1: /* Blinking Block (Default) */
+		case 2: /* Steady Block */
+			g.mode |= term.line[term.c.y][curx].mode & ATTR_WIDE;
+			xdrawglyph(g, term.c.x, term.c.y);
+			break;
+		case 3: /* Blinking Underline */
+		case 4: /* Steady Underline */
+			XftDrawRect(xw.draw, &drawcol,
+					borderpx + curx * xw.cw,
+					borderpx + (term.c.y + 1) * xw.ch - \
+						cursorthickness,
+					xw.cw, cursorthickness);
+			break;
+		case 5: /* Blinking bar */
+		case 6: /* Steady bar */
+			XftDrawRect(xw.draw, &drawcol,
+					borderpx + curx * xw.cw,
+					borderpx + term.c.y * xw.ch,
+					cursorthickness, xw.ch);
+			break;
 		}
 	} else {
-		XftDrawRect(xw.draw, &dc.col[defaultcs],
+		XftDrawRect(xw.draw, &drawcol,
 				borderpx + curx * xw.cw,
 				borderpx + term.c.y * xw.ch,
 				xw.cw - 1, 1);
-		XftDrawRect(xw.draw, &dc.col[defaultcs],
+		XftDrawRect(xw.draw, &drawcol,
 				borderpx + curx * xw.cw,
 				borderpx + term.c.y * xw.ch,
 				1, xw.ch - 1);
-		XftDrawRect(xw.draw, &dc.col[defaultcs],
+		XftDrawRect(xw.draw, &drawcol,
 				borderpx + (curx + 1) * xw.cw - 1,
 				borderpx + term.c.y * xw.ch,
 				1, xw.ch - 1);
-		XftDrawRect(xw.draw, &dc.col[defaultcs],
+		XftDrawRect(xw.draw, &drawcol,
 				borderpx + curx * xw.cw,
 				borderpx + (term.c.y + 1) * xw.ch - 1,
 				xw.cw, 1);
@@ -3941,7 +3967,7 @@ drawregion(int x1, int y1, int x2, int y2)
 {
 	int i, x, y, ox, numspecs;
 	Glyph base, new;
-	XftGlyphFontSpec* specs;
+	XftGlyphFontSpec *specs;
 	int ena_sel = sel.ob.x != -1 && sel.alt == IS_SET(MODE_ALTSCREEN);
 
 	if (!(xw.state & WIN_VISIBLE))
@@ -3951,7 +3977,6 @@ drawregion(int x1, int y1, int x2, int y2)
 		if (!term.dirty[y])
 			continue;
 
-		xtermclear(0, y, term.col, y);
 		term.dirty[y] = 0;
 
 		specs = term.specbuf;
@@ -4177,7 +4202,6 @@ cresize(int width, int height)
 
 	tresize(col, row);
 	xresize(col, row);
-	ttyresize();
 }
 
 void
@@ -4187,6 +4211,7 @@ resize(XEvent *e)
 		return;
 
 	cresize(e->xconfigure.width, e->xconfigure.height);
+	ttyresize();
 }
 
 void
@@ -4215,8 +4240,9 @@ run(void)
 		}
 	} while (ev.type != MapNotify);
 
-	ttynew();
 	cresize(w, h);
+	ttynew();
+	ttyresize();
 
 	clock_gettime(CLOCK_MONOTONIC, &last);
 	lastblink = last;
@@ -4300,14 +4326,14 @@ run(void)
 void
 usage(void)
 {
-	die("%s " VERSION " (c) 2010-2015 st engineers\n"
-	"usage: st [-a] [-v] [-c class] [-f font] [-g geometry] [-o file]\n"
-	"          [-i] [-t title] [-T title] [-w windowid] [-e command ...]"
-	" [command ...]\n"
-	"       st [-a] [-v] [-c class] [-f font] [-g geometry] [-o file]\n"
-	"          [-i] [-t title] [-T title] [-w windowid] -l line"
-	" [stty_args ...]\n",
-	argv0);
+	die("usage: %s [-aiv] [-c class] [-f font] [-g geometry]"
+	    " [-n name] [-o file]\n"
+	    "          [-T title] [-t title] [-w windowid]"
+	    " [[-e] command [args ...]]\n"
+	    "       %s [-aiv] [-c class] [-f font] [-g geometry]"
+	    " [-n name] [-o file]\n"
+	    "          [-T title] [-t title] [-w windowid] -l line"
+	    " [stty_args ...]\n", argv0, argv0);
 }
 
 int
@@ -4346,6 +4372,9 @@ main(int argc, char *argv[])
 	case 'l':
 		opt_line = EARGF(usage());
 		break;
+	case 'n':
+		opt_name = EARGF(usage());
+		break;
 	case 't':
 	case 'T':
 		opt_title = EARGF(usage());
@@ -4354,6 +4383,8 @@ main(int argc, char *argv[])
 		opt_embed = EARGF(usage());
 		break;
 	case 'v':
+		die("%s " VERSION " (c) 2010-2016 st engineers\n", argv0);
+		break;
 	default:
 		usage();
 	} ARGEND;

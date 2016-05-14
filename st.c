@@ -1182,6 +1182,7 @@ clippaste(const Arg *dummy)
 {
 	Atom clipboard;
 
+
 	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
 	XConvertSelection(xw.dpy, clipboard, sel.xtarget, clipboard,
 			xw.win, CurrentTime);

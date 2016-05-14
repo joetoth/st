@@ -5,8 +5,8 @@
  *
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
-static char font[] = "Mono:pixelsize=10:antialias=true:autohint=true";
-static int borderpx = 2;
+static char font[] = "DejaVu Sans Mono:pixelsize=10:antialias=true:hinting=true";
+static int borderpx = 1;
 
 /*
  * What program is execed by st depends of these precedence rules:
@@ -155,6 +155,7 @@ static Shortcut shortcuts[] = {
 	{ ControlMask|ShiftMask,XK_V,           selpaste,       {.i =  0} },
 	{ ControlMask|ShiftMask,XK_Insert,      clippaste,      {.i =  0} },
 	{ MODKEY|ShiftMask,     XK_C,           clipcopy,       {.i =  0} },
+	{ Mod4Mask,             XK_V,           clippaste,      {.i =  0} },
 	{ MODKEY,               XK_Num_Lock,    numlock,        {.i =  0} },
 };
 

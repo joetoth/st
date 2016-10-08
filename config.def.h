@@ -153,6 +153,7 @@ static Shortcut shortcuts[] = {
 	{ MODKEY|ShiftMask,     XK_Next,        xzoom,          {.f = -1} },
 	{ MODKEY|ShiftMask,     XK_Home,        xzoomreset,     {.f =  0} },
 	{ ControlMask|ShiftMask,XK_V,           selpaste,       {.i =  0} },
+	{ ShiftMask,						XK_Return,      selpaste,       {.i =  0} },
 	{ ControlMask|ShiftMask,XK_Insert,      clippaste,      {.i =  0} },
 	{ MODKEY|ShiftMask,     XK_C,           clipcopy,       {.i =  0} },
 	{ Mod4Mask,             XK_V,           clippaste,      {.i =  0} },
